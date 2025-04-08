@@ -1,5 +1,8 @@
 streamlit
-langchain_core
-langchain_community
-langchain_ollama
-pdfplumber
+langchain>=0.1.0,<0.2.0 # Pin major version for stability if needed
+langchain-community>=0.0.20 # Contains PDFPlumberLoader, Ollama etc.
+langchain-core>=0.1.20
+langchain-text-splitters>=0.0.1
+langchain-ollama>=0.0.1 # Specific Ollama integration
+pdfplumber>=0.10.0 # Dependency for PDFPlumberLoader
+rank_bm25>=0.2.0 # Dependency for BM25Retriever

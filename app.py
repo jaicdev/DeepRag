@@ -1,123 +1,177 @@
 import streamlit as st
 import os
 import tempfile
-from deeprag import process_documents, find_related_documents, generate_answer
+import config # Import configuration constants
 
-st.markdown("""
-<style>
-.stApp {
-    background-color: #0E1117;
-    color: #FFFFFF;
-}
-/* Chat Input Styling */
-.stChatInput input {
-    background-color: #1E1E1E !important;
-    color: #FFFFFF !important;
-    border: 1px solid #3A3A3A !important;
-}
-/* User Message Styling */
-.stChatMessage[data-testid="stChatMessage"]:nth-child(odd) {
-    background-color: #1E1E1E !important;
-    border: 1px solid #3A3A3A !important;
-    color: #E0E0E0 !important;
-    border-radius: 10px;
-    padding: 15px;
-    margin: 10px 0;
-}
-/* Assistant Message Styling */
-.stChatMessage[data-testid="stChatMessage"]:nth-child(even) {
-    background-color: #2A2A2A !important;
-    border: 1px solid #404040 !important;
-    color: #F0F0F0 !important;
-    border-radius: 10px;
-    padding: 15px;
-    margin: 10px 0;
-}
-h1, h2, h3 {
-    color: #00FFAA !important;
-}
-</style>
-""", unsafe_allow_html=True)
+# Import functions from other modules
+from document_processor import load_pdf_documents, chunk_documents
+from retriever_setup import setup_bm25_retriever, setup_multi_vector_retrieval, setup_hybrid_retriever
+from llm_utils import generate_answer, rerank_documents, LANGUAGE_MODEL, EMBEDDING_MODEL
 
-st.title("📘 DeepRag")
-st.markdown("### Your Intelligent Document Assistant")
-st.markdown("---")
+# --- Session State Initialization ---
+# Clear state on first load or if models failed
+if "app_ready" not in st.session_state or not LANGUAGE_MODEL or not EMBEDDING_MODEL:
+    st.session_state.clear() # Clear all session state
+    st.session_state.app_ready = LANGUAGE_MODEL is not None and EMBEDDING_MODEL is not None
+    st.session_state.document_chunks = []
+    st.session_state.bm25_retriever = None
+    st.session_state.multi_vector_retriever = None
+    st.session_state.hybrid_retriever = None
+    st.session_state.processed_file_name = None
 
-# Initialize session state
-if "processed_docs" not in st.session_state:
-    st.session_state.processed_docs = False
-if "chat_history" not in st.session_state:
-    st.session_state.chat_history = []
 
-# File Upload Section
-uploaded_pdf = st.file_uploader(
-    "Upload Research Document (PDF)",
-    type="pdf",
-    help="Select a PDF document for analysis",
-    accept_multiple_files=False
-)
+# --- Core Processing Functions ---
 
-if uploaded_pdf:
-    if not st.session_state.processed_docs:
+def process_documents(file_path):
+    """Load, chunk, and set up retrievers for a PDF document."""
+    if not st.session_state.app_ready:
+         st.error("LLM or Embedding models failed to load. Cannot process documents.")
+         return False
+
+    # Use ONE st.status() context for the whole process
+    with st.status("Processing document...", expanded=True) as status:
         try:
-            with st.spinner("Processing document..."):
-                # Create a temporary file
-                with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as tmp_file:
-                    tmp_file.write(uploaded_pdf.getbuffer())
-                    tmp_path = tmp_file.name
-                
-                # Process the document using the temporary file path
-                process_documents(tmp_path)
-                st.session_state.processed_docs = True
-                
-                # Clean up the temporary file after processing
-                os.unlink(tmp_path)
-            
-            st.success("✅ Document processed successfully with advanced retrieval features!")
-        except Exception as e:
-            st.error(f"Error processing document: {str(e)}")
-    else:
-        st.success("✅ Document processed successfully with advanced retrieval features!")
-    
-    with st.expander("Advanced Retrieval Features"):
-        st.markdown("""
-        This application uses:
-        1. **Hybrid Search** - Combines keyword matching (BM25) with semantic search
-        2. **Multi-Vector Retrieval** - Stores multiple representations of each document chunk
-        3. **Re-Ranking** - Applies secondary scoring to refine search results
-        """)
-    
-    # Display chat history
-    for message in st.session_state.chat_history:
-        with st.chat_message(message["role"]):
-            st.write(message["content"])
-    
-    # Chat input
-    user_input = st.chat_input("Enter your question about the document...")
-    
-    if user_input:
-        # Add user message to chat history
-        st.session_state.chat_history.append({"role": "user", "content": user_input})
-        
-        with st.chat_message("user"):
-            st.write(user_input)
-        
-        with st.spinner("Analyzing document..."):
-            relevant_docs = find_related_documents(user_input)
-            ai_response = generate_answer(user_input, relevant_docs)
-        
-        # Add assistant response to chat history
-        st.session_state.chat_history.append({"role": "assistant", "content": ai_response})
-        
-        with st.chat_message("assistant", avatar="🤖"):
-            st.write(ai_response)
-            
-            with st.expander("View source passages"):
-                for i, doc in enumerate(relevant_docs):
-                    st.markdown(f"**Passage {i+1}**")
-                    st.markdown(doc.page_content)
-                    st.divider()
-        
-        # Force a rerun to update the chat display
-        st.rerun()
+            status.update(label="Loading PDF document...")
+            raw_docs = load_pdf_documents(file_path)
+            if not raw_docs:
+                status.update(label="Failed to load document.", state="error", expanded=True)
+                return False # Stop processing if loading failed
 
+            status.update(label="Chunking document...")
+            st.session_state.document_chunks = chunk_documents(raw_docs)
+            status.update(label=f"Document split into {len(st.session_state.document_chunks)} chunks.")
+
+            if not st.session_state.document_chunks:
+                 status.update(label="No content found after chunking.", state="error", expanded=True)
+                 return False
+
+            status.update(label="Setting up keyword search (BM25)...")
+            st.session_state.bm25_retriever = setup_bm25_retriever(st.session_state.document_chunks)
+
+            status.update(label="Setting up multi-vector retriever (this may take a moment)...")
+            # Pass the 'status' context object down
+            st.session_state.multi_vector_retriever = setup_multi_vector_retrieval(
+                st.session_state.document_chunks,
+                status_context=status
+            )
+
+            status.update(label="Configuring hybrid retrieval system...")
+            st.session_state.hybrid_retriever = setup_hybrid_retriever(
+                st.session_state.multi_vector_retriever,
+                st.session_state.bm25_retriever
+            )
+
+            if st.session_state.hybrid_retriever:
+                status.update(label="Document processing complete!", state="complete")
+                st.success("✅ Document processed successfully!") # Add explicit success message outside status
+                return True
+            else:
+                 status.update(label="Failed to set up retrieval system.", state="error", expanded=True)
+                 return False
+
+        except Exception as e:
+            status.update(label=f"Error during processing: {str(e)}", state="error", expanded=True)
+            st.error(f"An error occurred during processing: {str(e)}") # Also show error outside status
+            # Clean up potentially partially initialized state
+            st.session_state.bm25_retriever = None
+            st.session_state.multi_vector_retriever = None
+            st.session_state.hybrid_retriever = None
+            return False
+
+
+def find_related_documents(query):
+    """Find related documents using hybrid retrieval and reranking."""
+    if not st.session_state.get("hybrid_retriever"): # Check if retriever exists
+        st.error("Document not processed or retriever not ready. Please upload and process a document first.")
+        return []
+
+    # Retrieve documents using hybrid retrieval
+    with st.spinner("Retrieving relevant document sections..."):
+        try:
+            docs = st.session_state.hybrid_retriever.get_relevant_documents(query)
+            if not docs:
+                st.warning("No relevant sections found by initial retrieval.")
+                return []
+        except Exception as e:
+            st.error(f"Error during retrieval: {e}")
+            return []
+
+    # Rerank documents
+    with st.spinner(f"Reranking {len(docs)} results for better relevance..."):
+        try:
+            reranked_docs = rerank_documents(docs, query)
+        except Exception as e:
+            st.error(f"Error during reranking: {e}")
+            reranked_docs = docs # Fallback to non-reranked docs if reranking fails
+
+    # Return top N after reranking based on config
+    return reranked_docs[:config.RERANKED_RESULTS_COUNT]
+
+# --- Streamlit UI ---
+
+st.set_page_config(layout="wide") # Use wider layout
+st.title("DeepRAG")
+st.caption(f"Using Ollama ({config.LLM_MODEL_NAME}), Multi-Vector Retrieval, Hybrid Search, and LLM Reranking")
+
+if not st.session_state.app_ready:
+    st.error("Initialization failed. Please ensure Ollama is running and models are available, then refresh.")
+else:
+    uploaded_file = st.file_uploader("1. Upload your PDF document", type="pdf", key="pdf_uploader")
+
+    if uploaded_file is not None:
+        # Process document only if it's new or hasn't been processed successfully
+        if st.session_state.processed_file_name != uploaded_file.name:
+            st.info(f"Processing '{uploaded_file.name}'...")
+            # Use temp file for robust path handling across OS
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as temp_file:
+                temp_file.write(uploaded_file.getvalue())
+                file_path = temp_file.name
+
+            processing_successful = process_documents(file_path)
+
+            # Clean up the temporary file
+            if os.path.exists(file_path):
+                os.unlink(file_path)
+
+            if processing_successful:
+                st.session_state.processed_file_name = uploaded_file.name # Mark file as processed successfully
+            else:
+                # Reset processed file name if processing failed to allow reprocessing
+                st.session_state.processed_file_name = None
+                st.session_state.hybrid_retriever = None # Ensure retriever is cleared on failure
+
+
+    # Only show query section if a document has been successfully processed
+    if st.session_state.get("hybrid_retriever") and st.session_state.processed_file_name:
+        st.markdown("---")
+        st.header(f"2. Ask questions about '{st.session_state.processed_file_name}'")
+        user_query = st.text_input("Enter your question:", key="query_input", value="")
+
+        if user_query:
+            related_docs = find_related_documents(user_query)
+
+            if related_docs:
+                # Generate the answer using the final set of context documents
+                answer = generate_answer(user_query, related_docs)
+
+                st.markdown("### Answer")
+                st.markdown(answer) # Use markdown for potentially better formatting from LLM
+
+                # Display the context used for the answer
+                with st.expander("📚 Show Relevant Context Used for Answer"):
+                    for i, doc in enumerate(related_docs):
+                        st.markdown(f"**Context Chunk {i+1} (Highly Relevant)**")
+                        st.markdown(f"> {doc.page_content}")
+                        # Optionally show metadata like page number if available and parsed correctly
+                        page_num = doc.metadata.get('page', None)
+                        if page_num is not None:
+                            st.caption(f"Source: Page {page_num + 1}") # PDFPlumber page numbers are 0-indexed
+                        st.markdown("---")
+            else:
+                # If find_related_documents returned empty (e.g., retrieval or reranking found nothing)
+                st.warning("Could not find relevant context to formulate an answer based on the document.")
+
+    elif uploaded_file is not None and st.session_state.processed_file_name != uploaded_file.name:
+        st.info("Document processing is required or encountered an error. Check status messages above.")
+    elif uploaded_file is None:
+         st.info("Upload a PDF document to begin.")
