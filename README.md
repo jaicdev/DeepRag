@@ -21,5 +21,3 @@ DeepRag is a Streamlit app that lets you chat with your PDF documents using adva
 DeepRag creates multiple representations of your document (original text, summaries, entities), indexes them using both keyword and semantic search, and employs an LLM to re-rank and synthesize the most relevant information when answering your questions.
 
 Built with Python, Streamlit, LangChain, and Ollama.
-
-`Note: Code will be modularised soon!`
